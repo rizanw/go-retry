@@ -1,84 +1,121 @@
+// Package retry runs a function repeatedly until it succeeds, with configurable
+// attempt limits, delays, exponential backoff, jitter, and an overall time budget.
 package retry
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"time"
 )
 
 type Option struct {
-	MaxRetries     int                                                         // Maximum number of retry attempts (default: 3)
-	Delay          time.Duration                                               // Initial delay between retries (default: 1 second)
-	Timeout        time.Duration                                               // Total timeout for retries (default: 5 seconds)
-	UseExponential bool                                                        // Enable exponential backoff (default: false)
-	UseJitter      bool                                                        // Add random jitter to the delay (default: false)
-	OnRetry        func(totalAttempt int, totalDelay time.Duration, err error) // Callback function for custom retry event handling
+	MaxRetries     int                                                         // Maximum number of attempts, including the first call (default: 3)
+	Delay          time.Duration                                               // Delay before the first retry (default: 1 second)
+	MaxDelay       time.Duration                                               // Upper bound for a single delay when using exponential backoff (default: no limit)
+	Timeout        time.Duration                                               // Total time budget for all attempts and delays (default: 5 seconds)
+	UseExponential bool                                                        // Double the delay after each retry (default: false)
+	UseJitter      bool                                                        // Randomize each delay between 50% and 150% (default: false)
+	OnRetry        func(totalAttempt int, totalDelay time.Duration, err error) // Called after every failed attempt
 }
 
-// fillDefault will set required options with default value if it is not set.
-func (o *Option) fillDefault() {
-	if o.MaxRetries <= 0 {
-		o.MaxRetries = 3
+// withDefaults returns a copy of the options with defaults filled in, so the
+// caller's Option is never modified and can be shared between goroutines.
+func (o *Option) withDefaults() Option {
+	var opts Option
+	if o != nil {
+		opts = *o
 	}
-	if o.Delay <= 0 {
-		o.Delay = 1 * time.Second
+	if opts.MaxRetries <= 0 {
+		opts.MaxRetries = 3
 	}
-	if o.Timeout <= 0 {
-		o.Timeout = 5 * time.Second
+	if opts.Delay <= 0 {
+		opts.Delay = 1 * time.Second
 	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 5 * time.Second
+	}
+	return opts
 }
 
-// Do attempts to execute the provided function 'f' multiple times with retry logic.
-// It will retry the function execution based on the specified options.
+// unrecoverableError marks an error that should not be retried.
+type unrecoverableError struct{ err error }
+
+func (e unrecoverableError) Error() string { return e.err.Error() }
+func (e unrecoverableError) Unwrap() error { return e.err }
+
+// Unrecoverable wraps err so that Do stops immediately and returns it, for
+// failures that retrying can't fix (bad input, 4xx responses, not found).
+// errors.Is and errors.As still see the original error.
+func Unrecoverable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return unrecoverableError{err: err}
+}
+
+// Do calls f until it returns nil, an unrecoverable error, the attempt limit or
+// time budget is reached, or ctx is cancelled. When it gives up, the returned
+// error wraps the last error from f, so errors.Is/As work on it.
 func Do(ctx context.Context, f func() error, opts *Option) error {
-	if opts == nil {
-		opts = &Option{}
+	o := opts.withDefaults()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	opts.fillDefault()
 
 	var (
-		attempts   = 0
+		start      = time.Now()
+		baseDelay  = o.Delay
 		totalDelay time.Duration
-		delay      = opts.Delay
 	)
 
-	for {
-		attempts++
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("retry cancelled at %d attempt(s): %w", attempts, ctx.Err())
-		default:
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("retry cancelled before attempt %d: %w", attempt, err)
 		}
 
 		err := f()
 		if err == nil {
-			if attempts > 1 {
-				log.Printf("[Retry] Attempt succeeded after %d attempt(s)\n", attempts)
-			}
 			return nil
 		}
 
-		if opts.OnRetry != nil {
-			opts.OnRetry(attempts, totalDelay, err)
+		var stop unrecoverableError
+		if errors.As(err, &stop) {
+			return stop.err
 		}
 
-		if attempts >= opts.MaxRetries {
-			return fmt.Errorf("retry failed after %d attempt(s) with total delay: %fs", attempts, totalDelay.Seconds())
-		}
-		if totalDelay >= opts.Timeout {
-			return fmt.Errorf("retry failed after reach timeout(%fs) with %d attempt(s) ", opts.Timeout.Seconds(), attempts)
+		if o.OnRetry != nil {
+			o.OnRetry(attempt, totalDelay, err)
 		}
 
-		if opts.UseJitter {
-			jitter := rand.Float64()*1.0 + 0.5
-			delay = time.Duration(float64(delay) * jitter)
+		if attempt >= o.MaxRetries {
+			return fmt.Errorf("retry failed after %d attempt(s): %w", attempt, err)
+		}
+
+		delay := baseDelay
+		if o.UseJitter {
+			delay = time.Duration(float64(delay) * (0.5 + rand.Float64()))
+		}
+
+		if time.Since(start)+delay > o.Timeout {
+			return fmt.Errorf("retry timed out after %d attempt(s) (timeout %s): %w", attempt, o.Timeout, err)
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("retry cancelled after %d attempt(s): %w (last error: %w)", attempt, ctx.Err(), err)
+		case <-timer.C:
 		}
 		totalDelay += delay
-		time.Sleep(delay)
-		if opts.UseExponential {
-			delay = delay * 2
+
+		if o.UseExponential {
+			baseDelay *= 2
+			if o.MaxDelay > 0 && baseDelay > o.MaxDelay {
+				baseDelay = o.MaxDelay
+			}
 		}
 	}
 }

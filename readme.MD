@@ -1,197 +1,161 @@
-# Retry
+# go-retry
 
-A simple Go package that provides retry logic for executing functions with customizable options such as retry count,
-delay, timeout, exponential backoff, and jitter.
+[![Go Reference](https://pkg.go.dev/badge/github.com/rizanw/go-retry.svg)](https://pkg.go.dev/github.com/rizanw/go-retry)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A small, dependency-free Go package for retrying operations that can fail temporarily, such as network calls, message publishing, or database writes. It supports fixed delays, exponential backoff with an optional cap, jitter, an overall time budget, context cancellation, and errors that should not be retried.
+
+```go
+err := retry.Do(ctx, func() error {
+    return publish(msg)
+}, &retry.Option{MaxRetries: 5, UseExponential: true, UseJitter: true})
+```
+
+## Installation
+
+```bash
+go get github.com/rizanw/go-retry
+```
+
+Requires Go 1.20 or newer.
 
 ## Features
 
-- Retry a function multiple times if it fails.
-- Customize the number of retry attempts.
-- Specify the delay between retries with optional jitter.
-- Exponential backoff support for retries.
-- Timeout to stop retrying after a certain period.
-- Support context cancellation.
+- **Attempt limit**: stop after a maximum number of attempts
+- **Fixed or exponential delay**: wait the same time between attempts, or double it each time, with an optional `MaxDelay` cap
+- **Jitter**: randomize each delay so many clients don't retry in lockstep
+- **Time budget**: stop when the next retry would go past `Timeout`
+- **Context-aware**: cancelling `ctx` stops retrying immediately, even in the middle of a delay
+- **Unrecoverable errors**: wrap an error with `retry.Unrecoverable` to stop right away
+- **Useful errors**: the final error wraps the last failure, so `errors.Is` and `errors.As` work
+- **Hooks**: `OnRetry` is called after every failed attempt, for logging or metrics
 
 ## Usage
 
-To use the retry package, you need to call the Do function with the function you want to retry. Here's a simple example:
-
 ```go
-opts := retry.Option{
+import (
+    "context"
+    "time"
+
+    "github.com/rizanw/go-retry"
+)
+
+err := retry.Do(ctx, func() error {
+    return publishData() // any operation that may fail
+}, &retry.Option{
     MaxRetries:     4,
-    Delay:          1 * time.Second,
-    Timeout:        6 * time.Second,
+    Delay:          500 * time.Millisecond,
+    Timeout:        10 * time.Second,
     UseExponential: true,
     UseJitter:      true,
-}
-
-err := retry.Do(ctx, func () error {
-    // do something ....
-    return publishData() // example: publish data that may fail
-}, opts)
+    OnRetry: func(attempt int, totalDelay time.Duration, err error) {
+        log.Printf("attempt %d failed (waited %s so far): %v", attempt, totalDelay, err)
+    },
+})
 if err != nil {
-    // do something if retry is failed
+    // every attempt failed; err wraps the last error from publishData
 }
-
 ```
+
+Pass `nil` as the options to use the defaults.
 
 ## Options
 
-The Option struct allows you to customize the retry behavior:
+| Field | Default | Description |
+|---|---|---|
+| `MaxRetries` | 3 | maximum number of attempts, **including the first call** |
+| `Delay` | 1s | wait before the first retry |
+| `MaxDelay` | none | upper bound for a single delay when `UseExponential` is on |
+| `Timeout` | 5s | total time budget; Do stops if the next retry would start after it |
+| `UseExponential` | false | double the delay after each retry |
+| `UseJitter` | false | randomize each delay to between 50% and 150% of its value |
+| `OnRetry` | nil | `func(attempt int, totalDelay time.Duration, err error)`, called after every failed attempt |
+
+`Timeout` and `MaxRetries` both apply, and whichever is reached first ends the retries. Make sure `Timeout` is long enough for the delays you configure: with the defaults (3 attempts, 1s delay) the last attempt starts at 2s, well inside 5s, but 5 attempts with exponential backoff from 1s need 15s.
+
+`Timeout` doesn't interrupt a call that's already running. To bound each individual call, give `f` its own context with a deadline, and use `ctx` to bound the whole operation.
+
+## Errors
+
+| Situation | Returned error |
+|---|---|
+| `f` succeeds | `nil` |
+| all attempts fail | wraps the last error from `f` |
+| time budget reached | wraps the last error from `f` |
+| `ctx` cancelled or expired | wraps both `ctx.Err()` and the last error from `f` |
+| `f` returns `retry.Unrecoverable(err)` | `err` itself, after a single attempt |
 
 ```go
-type Option struct {
-    MaxRetries     int           // Maximum number of retry attempts (default: 3)
-    Delay          time.Duration // Initial delay between retries (default: 1 second)
-    Timeout        time.Duration // Total timeout for retries (default: 5 seconds)
-    UseExponential bool          // Enable exponential backoff (default: false)
-    UseJitter      bool          // Add random jitter to the delay (default: false)
-    OnRetry        func(totalAttempt int, totalDelay time.Duration, err error) // Callback function for custom retry event handling
+if errors.Is(err, context.Canceled) {
+    // the caller gave up
+}
+var apiErr *APIError
+if errors.As(err, &apiErr) {
+    // inspect the last failure
 }
 ```
 
-- `MaxRetries`: The maximum number of times the function will be retried. Defaults to 3.
-- `Delay`: The initial delay between retries. Defaults to 1 * time.Second.
-- `Timeout`: The total timeout before stopping retries. Defaults to 5 * time.Second.
-- `UseExponential`: If true, the delay will increase exponentially after each retry (e.g., 1s, 2s, 4s, etc.). Defaults
-  to false.
-- `UseJitter`: If true, random jitter is added to the delay between retries to prevent thundering herd problems.
-  Defaults to false.
-- `OnRetry`: a function that receives the total attempts, total delay, and error as arguments, allowing for custom retry event handling.
+### Don't retry what can't succeed
 
---- 
-
-## Example Use-Cases
-
-Retry package can be used in various scenarios and strategies. You can explore and consider the tradeoff before
-implement it in your system. Here are some examples:
-
-### Linear Retry with Max Attempts
-
-In a linear retry strategy, the time between retries increases by a fixed, constant amount.
-
-#### Tradeoffs
-
-- Pros:
-    - Simple and predictable.
-    - Low Latency: The total time to retry is the sum of all delays.
-    - Constant Load: The number of retries per unit time is constant.
-- Cons:
-    - May Overload the System: when the delays are too short, the system may be overloaded with too many retries.
-    - Inefficient in High-Failure Scenarios: In scenarios with high failure rates, linear retry may not be efficient as
-      it.
-
-#### Example Flow & Usage
-
-**Use case**: retry 4 times with a delay of 2 seconds between each retry.
-
-**Flow:**
-
-```
-Retry 1: After 2 second  
-Retry 2: After 4 seconds  
-Retry 3: After 6 seconds  
-Retry 4: After 8 seconds 
-Stop if still failing
-```
-
-**Code:**
+Some failures won't change on a retry, such as invalid input, a `400 Bad Request`, or a `404 Not Found`. Wrap them with `retry.Unrecoverable` to stop immediately and return the original error:
 
 ```go
-opts := retry.Option{
-    MaxRetries:     4,
-    Delay:          2 * time.Second,
-}
+err := retry.Do(ctx, func() error {
+    resp, err := client.Do(req)
+    if err != nil {
+        return err // network error: retry
+    }
+    defer resp.Body.Close()
 
-err := retry.Do(ctx, func () error {
-    // Simulate a function that may fail
-    return errors.New("temporary error")
-}, opts)
-if err != nil {
-    fmt.Println("Failed:", err)
+    switch {
+    case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
+        return fmt.Errorf("server error: %s", resp.Status) // retry
+    case resp.StatusCode >= 400:
+        return retry.Unrecoverable(fmt.Errorf("client error: %s", resp.Status)) // don't retry
+    }
+    return nil
+}, &retry.Option{MaxRetries: 4, UseExponential: true})
+```
+
+## Choosing a strategy
+
+### Fixed delay
+
+Wait the same amount of time between attempts. Simple and predictable, and fine for a single client or short outages. With many clients it can keep hammering a struggling service at a steady rate.
+
+```go
+// 4 attempts, 2s apart: at 0s, 2s, 4s, 6s
+opts := &retry.Option{
+    MaxRetries: 4,
+    Delay:      2 * time.Second,
+    Timeout:    10 * time.Second,
 }
 ```
 
-### Retry with exponential backoff
+### Exponential backoff
 
-In an exponential backoff strategy, the delay between retries increases exponentially, often with a random "jitter" to
-prevent retries from occurring simultaneously across many clients.
-
-#### Tradeoffs
-
-- Pros:
-    - Efficient in High-Failure Scenarios: Exponential backoff is efficient in scenarios with high failure rates as it.
-    - Better Adaptation to Failures: Exponential backoff allows the system to adapt to failures by increasing the delay.
-    - Avoids Thundering Herd Problem: Exponential backoff can help avoid the "thundering herd" problem, which occurs
-      when many clients retry simultaneously, causing a surge in traffic.
-- Cons:
-    - Complexity: Exponential backoff can be complicated, especially if you also need to consider jitter, max retry
-      limits, and other factors.
-    - Slower Recovery: Exponential backoff can lead to slower recovery times, especially if the maximum delay is set too
-      high.
-    - Potentially High Latency: Depending on the parameters (e.g., the base time for exponential growth), retries might
-      take longer to reattempt compared to a linear strategy.
-
-#### Example Flow & Usage
-
-**Use case**: retry 5 times with a delay of 1 second exponentially
-
-**Flow:**
-```
-Retry 1: After 1 second
-Retry 2: After 2 seconds
-Retry 3: After 4 seconds
-Retry 4: After 8 seconds
-Retry 5: After 16 seconds
-Stop if still failing
-```
-
-**Code:**
+Double the delay after each retry, so a failing service gets more and more room to recover. Add `MaxDelay` to keep waits reasonable and `UseJitter` to spread out clients that failed at the same moment, which avoids the "thundering herd" effect. This is the usual choice for calls to shared services.
 
 ```go
-
-opts := retry.Option{
+// 5 attempts at roughly 0s, 1s, 3s, 7s, 15s (delays 1s, 2s, 4s, 8s)
+opts := &retry.Option{
     MaxRetries:     5,
     Delay:          1 * time.Second,
-    UseExponential: true,
-}
-
-err := retry.Do(ctx, func () error {
-    // Simulate a function that may fail
-    return errors.New("temporary error")
-}, opts)
-if err != nil {
-    fmt.Println("Failed:", err)
-}
-```
-
-### How to handle 400 error code?
-
-To handle a 400 error code in a retry mechanism, you should treat it as a non-retryable error. A 400 Bad Request 
-indicates that the requested action could not be understood by the server due to invalid syntax or semantics, 
-so retrying wouldn't help. This also applies to certain errors depend on error.
-
-```go
-opts := retry.Option{
-    MaxRetries:     4,
-    Delay:          1 * time.Second,
-    Timeout:        6 * time.Second,
+    MaxDelay:       10 * time.Second,
+    Timeout:        20 * time.Second,
     UseExponential: true,
     UseJitter:      true,
 }
-
-err := retry.Do(ctx, func () error {
-	user, err = getData(req)
-	if err != nil {
-		if err.Error() == "Bad Request" {
-			// do not retry on specific status code 
-			return nil 
-		}
-		return err
-    }
-    return nil
-}, opts)
-if err != nil {
-    // do something if retry is failed
-}
 ```
+
+Only retry operations that are safe to repeat (idempotent). Retrying a payment or an order creation can perform it twice unless the upstream deduplicates requests.
+
+## Testing
+
+```bash
+go test ./...
+```
+
+## License
+
+[MIT](LICENSE)
