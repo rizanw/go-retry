@@ -179,3 +179,85 @@ func TestDo(t *testing.T) {
 		})
 	}
 }
+
+var errTemporary = errors.New("temporary error")
+
+func TestDo_WrapsLastError(t *testing.T) {
+	attempts := 0
+	err := Do(context.Background(), func() error {
+		attempts++
+		return errTemporary
+	}, &Option{MaxRetries: 3, Delay: time.Millisecond})
+
+	if !errors.Is(err, errTemporary) {
+		t.Fatalf("expected error to wrap the last error, got %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestDo_Unrecoverable(t *testing.T) {
+	errBadRequest := errors.New("bad request")
+	attempts := 0
+	err := Do(context.Background(), func() error {
+		attempts++
+		return Unrecoverable(errBadRequest)
+	}, &Option{MaxRetries: 5, Delay: time.Millisecond})
+
+	if err != errBadRequest {
+		t.Fatalf("expected the original error, got %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("expected no retries, got %d attempts", attempts)
+	}
+	if Unrecoverable(nil) != nil {
+		t.Fatal("Unrecoverable(nil) should be nil")
+	}
+}
+
+func TestDo_CancelDuringDelay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := Do(ctx, func() error { return errTemporary }, &Option{MaxRetries: 5, Delay: 10 * time.Second, Timeout: time.Minute})
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected Do to stop waiting when ctx is done, took %s", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errTemporary) {
+		t.Fatalf("expected both ctx error and last error, got %v", err)
+	}
+}
+
+func TestDo_ExponentialWithMaxDelay(t *testing.T) {
+	var delays []time.Duration
+	var last time.Duration
+	_ = Do(context.Background(), func() error { return errTemporary }, &Option{
+		MaxRetries:     5,
+		Delay:          10 * time.Millisecond,
+		MaxDelay:       25 * time.Millisecond,
+		Timeout:        time.Second,
+		UseExponential: true,
+		OnRetry: func(_ int, totalDelay time.Duration, _ error) {
+			delays = append(delays, totalDelay-last)
+			last = totalDelay
+		},
+	})
+
+	want := []time.Duration{0, 10, 20, 25, 25}
+	for i, d := range delays {
+		if d != want[i]*time.Millisecond {
+			t.Fatalf("delay %d: want %s, got %s (all: %v)", i, want[i]*time.Millisecond, d, delays)
+		}
+	}
+}
+
+func TestDo_DoesNotModifyOptions(t *testing.T) {
+	opts := &Option{}
+	_ = Do(context.Background(), func() error { return nil }, opts)
+	if opts.MaxRetries != 0 || opts.Delay != 0 || opts.Timeout != 0 {
+		t.Fatalf("Do should not modify the caller's options, got %+v", *opts)
+	}
+}
